@@ -1,7 +1,0 @@
-customtkinter
-PyPDF2
-scikit-learn
-nltk
-requests
-python-telegram-bot
-numpy
