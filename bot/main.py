@@ -28,10 +28,12 @@ LM_MODEL_NAME = os.getenv("LM_MODEL_NAME", "google/gemma-3-1b")
 PDF_PATH = os.getenv("PDF_PATH", "aplicaciones-inteligentes-en-la-ingenieria-del-futuro.pdf")
 
 SYSTEM_PROMPT = (
-    "Eres un asistente académico. Respondes solo con base en el documento proporcionado. "
-    "Si algo no está en el documento, di explícitamente que no está disponible en el material. "
+    "Eres un asistente académico. "
     "Mantén las respuestas concisas y, cuando corresponda, indica los fragmentos utilizados."
 )
+
+# Permitir fallback a conocimiento general cuando el PDF no sea suficiente
+ALLOW_GENERAL_FALLBACK = os.getenv("ALLOW_GENERAL_FALLBACK", "1") not in ("0", "false", "False")
 
 # Umbral mínimo de similitud
 MIN_CONTEXT_SCORE = 0.05
@@ -85,7 +87,7 @@ def read_pdf_text(path: str) -> str:
             logger.warning(f"Error leyendo página {i+1}: {e}")
     return "\n\n".join(texts)
 
-def chunk_text(text: str, max_tokens: int = 400, overlap: int = 100) -> List[str]:
+def chunk_text(text: str, max_tokens: int = 1600, overlap: int = 100) -> List[str]:
     words = text.split()
     chunk_size = max_tokens
     chunks = []
@@ -158,11 +160,13 @@ def build_prompt(contexts: List[Tuple[int, str, float]], question: str, limit_ch
         total += len(ct)
 
     context_block = "\n\n".join(context_texts) if context_texts else "No se recuperó contexto relevante."
+    # Proveer el contexto al modelo. No forzamos la exclusividad aquí: la lógica
+    # de fallback decidirá si el modelo puede usar conocimiento general.
     user_message = (
-        "Usa EXCLUSIVAMENTE el siguiente contexto del documento para responder.\n\n"
+        "A continuación tienes contexto extraído del documento que puedes usar para responder.\n\n"
         f"{context_block}\n\n"
         f"Pregunta: {question}\n\n"
-        "Si no está en el contexto, responde: 'No se encuentra en el material proporcionado.'"
+        "Si la información del documento no es suficiente, indícalo claramente."
     )
 
     messages = [
@@ -211,18 +215,24 @@ _PROCESSED_DEQUE = deque(maxlen=2048)
 _PROCESSED_SET = set()
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Bot académico cargado. Envía tu pregunta sobre la materia.\n"
-        "Respondo únicamente con base en el documento."
-    )
+    msg = "Bot académico cargado. Envía tu pregunta sobre la materia.\n"
+    if ALLOW_GENERAL_FALLBACK:
+        msg += "Puedo también intentar responder con conocimiento general si el PDF no contiene la información."
+    else:
+        msg += "Respondo únicamente con base en el documento."
+    await update.message.reply_text(msg)
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
+    msg = (
         "Envía una pregunta. Ejemplo:\n"
         " - ¿Cuál es la definición formal del concepto X?\n"
         " - Explica el teorema Y y sus condiciones.\n"
-        "Si no está en el PDF, te lo diré."
     )
+    if ALLOW_GENERAL_FALLBACK:
+        msg += "Si no está en el PDF, puedo intentar responder usando conocimiento general."
+    else:
+        msg += "Si no está en el PDF, te lo diré."
+    await update.message.reply_text(msg)
 
 async def ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global KB
@@ -280,11 +290,18 @@ async def ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     contexts = retrieve_context(KB, question, k=10)
     max_score = max([score for _, _, score in contexts], default=0.0)
 
-    # Con umbral bajo, casi siempre se pasa al modelo
+    # Decidir si permitimos fallback a conocimiento general
+    allow_fallback_now = ALLOW_GENERAL_FALLBACK and (max_score < MIN_CONTEXT_SCORE)
     if max_score < MIN_CONTEXT_SCORE:
-        logger.info("Contexto débil, pero se enviará al modelo igualmente.")
+        logger.info("Contexto débil detectado.")
 
     messages = build_prompt(contexts, question, limit_chars=7000)
+    if allow_fallback_now:
+        # permitir al modelo usar conocimiento general si el contexto no basta
+        messages[1]["content"] += (
+            "\n\nSi el contexto del documento no es suficiente, puedes responder usando conocimiento general. "
+            "Indica claramente cuando la respuesta proviene de fuera del documento."
+        )
 
     try:
         # longitud máxima de la respuesta en caracteres (configurable)
